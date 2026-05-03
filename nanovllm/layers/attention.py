@@ -45,14 +45,6 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
-def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return x
-    bs, num_kv_heads, seq_len, head_dim = x.shape
-    x = x.unsqueeze(2).expand(bs, num_kv_heads, n_rep, seq_len, head_dim)
-    return x.reshape(bs, num_kv_heads * n_rep, seq_len, head_dim)
-
-
 def _prefill_sdpa(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, num_heads, num_kv_heads):
     n_rep = num_heads // num_kv_heads
     batch_size = cu_seqlens_q.shape[0] - 1
@@ -63,29 +55,47 @@ def _prefill_sdpa(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_
         qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
         ki = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
         vi = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
-        ki = _repeat_kv(ki, n_rep)
-        vi = _repeat_kv(vi, n_rep)
+        if n_rep > 1:
+            ki = ki.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(1, num_heads, -1, ki.shape[-1])
+            vi = vi.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(1, num_heads, -1, vi.shape[-1])
         oi = F.scaled_dot_product_attention(qi, ki, vi, scale=scale, is_causal=True)
         outputs.append(oi.squeeze(0).transpose(0, 1))
     return torch.cat(outputs, dim=0)
 
 
 def _decode_sdpa(q, k_cache, v_cache, context_lens, block_tables, scale, num_heads, num_kv_heads, head_dim, block_size):
+    batch_size = q.shape[0]
+    max_num_blocks = block_tables.shape[1]
+    max_seq_len = max_num_blocks * block_size
     n_rep = num_heads // num_kv_heads
-    num_seqs = q.shape[0]
-    outputs = []
-    for i in range(num_seqs):
-        qi = q[i].unsqueeze(1).unsqueeze(0)
-        seq_len = context_lens[i].item()
-        num_blocks = (seq_len + block_size - 1) // block_size
-        block_ids = block_tables[i, :num_blocks]
-        ki = k_cache[block_ids].reshape(-1, num_kv_heads, head_dim)[:seq_len].transpose(0, 1).unsqueeze(0)
-        vi = v_cache[block_ids].reshape(-1, num_kv_heads, head_dim)[:seq_len].transpose(0, 1).unsqueeze(0)
-        ki = _repeat_kv(ki, n_rep)
-        vi = _repeat_kv(vi, n_rep)
-        oi = F.scaled_dot_product_attention(qi, ki, vi, scale=scale)
-        outputs.append(oi.squeeze(0).transpose(0, 1).squeeze(0))
-    return torch.stack(outputs, dim=0)
+
+    block_ids = block_tables.clamp(min=0)
+    k_paged = k_cache[block_ids]
+    v_paged = v_cache[block_ids]
+
+    k_flat = k_paged.reshape(batch_size, max_seq_len, num_kv_heads, head_dim)
+    v_flat = v_paged.reshape(batch_size, max_seq_len, num_kv_heads, head_dim)
+
+    arange = torch.arange(max_seq_len, device=q.device)
+    valid_mask = arange.unsqueeze(0) < context_lens.unsqueeze(1)
+
+    valid_kv = valid_mask.unsqueeze(-1).unsqueeze(-1).to(k_flat.dtype)
+    k_flat = k_flat * valid_kv
+    v_flat = v_flat * valid_kv
+
+    if n_rep > 1:
+        k_flat = k_flat.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(batch_size, max_seq_len, num_heads, head_dim)
+        v_flat = v_flat.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(batch_size, max_seq_len, num_heads, head_dim)
+
+    q_4d = q.unsqueeze(2)
+    k_4d = k_flat.transpose(1, 2)
+    v_4d = v_flat.transpose(1, 2)
+
+    attn_mask = torch.zeros(batch_size, 1, 1, max_seq_len, dtype=q.dtype, device=q.device)
+    attn_mask = attn_mask.masked_fill(~valid_mask.unsqueeze(1).unsqueeze(2), torch.finfo(q.dtype).min)
+
+    o = F.scaled_dot_product_attention(q_4d, k_4d, v_4d, attn_mask=attn_mask, scale=scale)
+    return o.squeeze(2)
 
 
 class Attention(nn.Module):

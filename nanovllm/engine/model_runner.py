@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.attention import _USE_FLASH_ATTN
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -34,11 +35,8 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        _can_capture_graph = not self.enforce_eager and torch.cuda.get_device_capability() >= (8, 0)
-        if _can_capture_graph:
+        if not self.enforce_eager:
             self.capture_cudagraph()
-        else:
-            self.enforce_eager = True
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -203,7 +201,10 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            suitable_bs = next((x for x in self.graph_bs if x >= bs), None)
+            if suitable_bs is None:
+                return self.model.compute_logits(self.model(input_ids, positions))
+            graph = self.graphs[suitable_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -229,6 +230,15 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        if not _USE_FLASH_ATTN:
+            torch.cuda.empty_cache()
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            num_heads = hf_config.num_attention_heads // self.world_size
+            head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+            bytes_per_seq = (2 * num_kv_heads + 2 * num_heads) * max_num_blocks * self.block_size * head_dim * 2
+            free, _ = torch.cuda.mem_get_info()
+            max_bs_by_mem = max(4, int(free * 0.15 / bytes_per_seq))
+            max_bs = min(max_bs, max_bs_by_mem)
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
