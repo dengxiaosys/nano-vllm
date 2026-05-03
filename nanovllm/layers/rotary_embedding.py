@@ -2,6 +2,9 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+_TORCH_COMPILE = torch.cuda.get_device_capability() >= (7, 0)
+_conditional_compile = torch.compile if _TORCH_COMPILE else lambda f: f
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -34,7 +37,7 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    @_conditional_compile
     def forward(
         self,
         positions: torch.Tensor,

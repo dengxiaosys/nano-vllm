@@ -1,10 +1,13 @@
 import torch
 from torch import nn
 
+_TORCH_COMPILE = torch.cuda.get_device_capability() >= (7, 0)
+_conditional_compile = torch.compile if _TORCH_COMPILE else lambda f: f
+
 
 class Sampler(nn.Module):
 
-    @torch.compile
+    @_conditional_compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)
