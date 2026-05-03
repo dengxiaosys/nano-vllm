@@ -34,8 +34,11 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        _can_capture_graph = not self.enforce_eager and torch.cuda.get_device_capability() >= (8, 0)
+        if _can_capture_graph:
             self.capture_cudagraph()
+        else:
+            self.enforce_eager = True
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
